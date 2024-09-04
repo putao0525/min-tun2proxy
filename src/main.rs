@@ -15,6 +15,8 @@ use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
 use crate::modules::self_packet::SelfPacket;
 use crate::modules::user_config::{ProxyType, UserConfig};
+use crate::platform::macos::mac_table::MacRouteTable;
+use crate::platform::RouteTable;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -22,8 +24,12 @@ async fn main() -> io::Result<()> {
     config.address((10, 0, 0, 1))?; // 设置 TUN 设备的 IP 地址
     config.netmask((255, 255, 255, 0))?; // 设置 TUN 设备的子网掩码
     config.mtu(1500); // 设置 TUN 设备的 MTU
-    let mut dev = create_tun_dev(&config).expect("创建tun设备失败");
     let user_conf = UserConfig::default();
+    //创建设备
+    let mut dev = create_tun_dev(&config).expect("创建tun设备失败");
+    //初始化路由表
+    let route_table: Box<dyn RouteTable> = Box::new(MacRouteTable::default());
+    route_table.init_route_table();
     // 读取和处理数据包
     let mut buf = [0u8; 1504];
     loop {
