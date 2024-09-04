@@ -1,9 +1,10 @@
 use std::io;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr};
 use async_trait::async_trait;
 use bb8::ManageConnection;
+use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
 
 pub struct Socks5ConnectionManager {

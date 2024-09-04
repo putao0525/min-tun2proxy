@@ -2,7 +2,7 @@
 pub mod macos;
 
 
-pub trait RouteTable {
+pub trait RouteTable: Sync + Sync {
     fn add_route(&self);
     fn del_route(&self);
     fn init_route_table(&self);

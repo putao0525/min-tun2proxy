@@ -1,14 +1,18 @@
 mod modules;
 mod platform;
+mod utils;
 
-use std::io::{self, Read, Write};
+use std::env;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use log::{error, info};
 use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::Packet;
 use pnet::packet::vlan::VlanPacket;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tun::platform::Device as TunDevice;
 use tun::{Configuration, Device};
 use tokio::net::TcpStream;
@@ -19,47 +23,36 @@ use crate::modules::self_packet::SelfPacket;
 use crate::modules::user_config::{ProxyType, UserConfig};
 use crate::platform::macos::mac_table::MacRouteTable;
 use crate::platform::RouteTable;
+use crate::utils::log::init_log_once;
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
-    let mut config = Configuration::default();
-    config.address((10, 0, 0, 1))?; // 设置 TUN 设备的 IP 地址
-    config.netmask((255, 255, 255, 0))?; // 设置 TUN 设备的子网掩码
-    config.mtu(1500); // 设置 TUN 设备的 MTU
-    let user_conf = UserConfig::default();
-    //初始化路由表
-    let route_table: Box<dyn RouteTable> = Box::new(MacRouteTable::default());
+async fn main() -> anyhow::Result<()> {
+    ///日志初始化
+    unsafe { env::set_var("RUST_LOG", "info"); }
+    init_log_once();
+    ///解析命令行参数
+    let user_conf = UserConfig::parse_params();
+    let route_table = Arc::new(MacRouteTable::default());
+    ///初始化路由表
     route_table.init_route_table();
-    let _ = signal_clean(&*route_table);
-    //创建设备
-    let mut dev = create_tun_dev(&config).expect("创建tun设备失败");
+    if user_conf.is_free_route_table {
+        //信息处理（这里主要是释放路由表资源)
+        // let _ = free_resource(route_table);
+    }
+    ///创建设备
+    let mut dev = create_tun_dev(&user_conf.tun_conf).expect("创建tun设备失败");
+    ///数据包处理
+    let _ = exe_packet(&mut dev, &user_conf);
+    Ok(())
+}
 
-    // 读取和处理数据包
+fn exe_packet(dev: &mut TunDevice, user_config: &UserConfig) -> anyhow::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
         let n = dev.read(&mut buf)?;
         println!("Read {} bytes", n);
-        packet_route(&*buf, &user_conf);
+        packet_route(&buf[..n], user_config);
     }
-}
-
-fn signal_clean(route_table: &dyn RouteTable) -> anyhow::Result<()> {
-// 创建一个任务来处理信号
-    let signal_task = task::spawn(async {
-        let sigint = signal::ctrl_c();
-        let sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap().recv();
-
-        tokio::select! {
-            _ = sigint => {
-                println!("Received SIGINT, performing cleanup...");
-            },
-            _ = sigterm => {
-                println!("Received SIGTERM, performing cleanup...");
-            },
-        }
-        route_table.free_route_table();
-    });
-    Ok(())
 }
 
 
@@ -68,8 +61,8 @@ fn packet_route(buf: &[u8], user_conf: &UserConfig) {
     if let Some(eth_packet) = EthernetPacket::new(buf) {
         match eth_packet.get_ethertype() {
             EtherTypes::Ipv4 => {
-                if let Some(packet) = (eth_packet.payload()) {
-                    let self_packet = SelfPacket::new_ipv4(packet);
+                if let Some(packet) = Ipv4Packet::new(eth_packet.payload()) {
+                    let self_packet = SelfPacket::new_ipv4(&packet);
                     let _ = forward_packet(self_packet, user_conf);
                 }
             }
@@ -105,7 +98,7 @@ fn packet_route(buf: &[u8], user_conf: &UserConfig) {
 fn create_tun_dev(config: &Configuration) -> anyhow::Result<TunDevice> {
     let mut dev = TunDevice::new(&config)?;
     let name = dev.name().to_string_lossy().into_owned();
-    println!("TUN device created: {}", name);
+    info!("TUN device created: {}", name);
     dev
 }
 
@@ -131,61 +124,49 @@ async fn forward_socks5(self_packet: SelfPacket<'_>, user_config: &UserConfig) -
 
     // 连接到 SOCKS5 代理服务器
     if user_config.is_use_proxy_pool {
-        println!("不支持代理ip池子");
+        error!("不支持代理ip池子");
         return Ok(());
     }
 
     let stream = TcpStream::connect(proxy_addr).await?;
-    let mut socks5_stream = Socks5Stream::connect_with_socket(stream, target_addr).await?;
-    let mut response_buffer = vec![0; 1500];
+    let socks5_stream = Socks5Stream::connect_with_socket(stream, target_addr).await?;
+    let tcp_stream = socks5_stream.into_inner();
+    let (mut client_reader, mut client_writer) = tcp_stream.into_split();
 
-    // 获取底层的 TcpStream
-    let mut tcp_stream = socks5_stream.into_inner();
-    let (mut reader, mut writer) = tcp_stream.split();
+    // 创建一个新的 TcpStream 连接到目标服务器
+    let target_stream = TcpStream::connect(target_addr).await?;
+    let (mut target_reader, mut target_writer) = target_stream.into_split();
 
-    // 从客户端读取数据并写入到 SOCKS5 代理
-    let client_to_socks5 = async {
-        let mut reader = reader; // 将 reader 移动到任务内部
-        let mut buffer = vec![0; 1500]; // 为每个任务创建独立的缓冲区
+    // 从客户端读取数据并写入到目标服务器
+    let client_to_target = transfer_data(&mut client_reader, &mut target_writer);
 
-        loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => break, // 连接关闭
-                Ok(n) => {
-                    if let Err(e) = writer.write_all(&buffer[..n]).await {
-                        eprintln!("Failed to write to SOCKS5: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to read from client: {}", e);
+    // 从目标服务器读取数据并写入到客户端
+    let target_to_client = transfer_data(&mut target_reader, &mut client_writer);
+
+    tokio::try_join!(client_to_target, target_to_client)?;
+    Ok(())
+}
+
+async fn transfer_data<R, W>(mut reader: R, mut writer: W) -> anyhow::Result<()>
+    where
+        R: AsyncReadExt + Unpin,
+        W: AsyncWriteExt + Unpin,
+{
+    let mut buffer = vec![0; 1500];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break, // 连接关闭
+            Ok(n) => {
+                if let Err(e) = writer.write_all(&buffer[..n]).await {
+                    error!("Failed to write: {}", e);
                     break;
                 }
             }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    // 从 SOCKS5 代理读取数据并写入到客户端
-    let socks5_to_client = async {
-        loop {
-            match reader.read(&mut response_buffer).await {
-                Ok(0) => break, // 连接关闭
-                Ok(n) => {
-                    if let Err(e) = writer.write_all(&response_buffer[..n]).await {
-                        eprintln!("Failed to write to client: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to read from SOCKS5: {}", e);
-                    break;
-                }
+            Err(e) => {
+                error!("Failed to read: {}", e);
+                break;
             }
         }
-        Ok::<(), io::Error>(())
-    };
-    // 并行运行两个任务
-    tokio::try_join!(client_to_socks5, socks5_to_client)?;
+    }
     Ok(())
 }
