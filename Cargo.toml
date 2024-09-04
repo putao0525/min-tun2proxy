@@ -12,4 +12,4 @@ anyhow = "1.0.86"
 hyper = "1.4.1"
 async-trait = "0.1.82"
 bb8 = "0.8.5"
-
+tokio-signal = "0.2.9"

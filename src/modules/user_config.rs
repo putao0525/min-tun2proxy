@@ -8,6 +8,7 @@ pub struct UserConfig {
     pub proxy_type: ProxyType,
     proxy_addr: String,
     pub is_use_proxy_pool: bool,
+    pub is_free_route_table: bool,
 }
 
 impl Default for UserConfig {
@@ -16,6 +17,7 @@ impl Default for UserConfig {
             proxy_type: ProxyType::Socks5,
             proxy_addr: String::from("192.168.2:8090"),
             is_use_proxy_pool: false,
+            is_free_route_table: true,
         }
     }
 }

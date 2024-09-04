@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::platform::Device as TunDevice;
 use tun::{Configuration, Device};
 use tokio::net::TcpStream;
+use tokio::{signal, task};
 use tokio_socks::tcp::Socks5Stream;
 use crate::modules::self_packet::SelfPacket;
 use crate::modules::user_config::{ProxyType, UserConfig};
@@ -25,11 +26,13 @@ async fn main() -> io::Result<()> {
     config.netmask((255, 255, 255, 0))?; // 设置 TUN 设备的子网掩码
     config.mtu(1500); // 设置 TUN 设备的 MTU
     let user_conf = UserConfig::default();
-    //创建设备
-    let mut dev = create_tun_dev(&config).expect("创建tun设备失败");
     //初始化路由表
     let route_table: Box<dyn RouteTable> = Box::new(MacRouteTable::default());
     route_table.init_route_table();
+    let _ = signal_clean(&*route_table);
+    //创建设备
+    let mut dev = create_tun_dev(&config).expect("创建tun设备失败");
+
     // 读取和处理数据包
     let mut buf = [0u8; 1504];
     loop {
@@ -38,6 +41,26 @@ async fn main() -> io::Result<()> {
         packet_route(&*buf, &user_conf);
     }
 }
+
+fn signal_clean(route_table: &dyn RouteTable) -> anyhow::Result<()> {
+// 创建一个任务来处理信号
+    let signal_task = task::spawn(async {
+        let sigint = signal::ctrl_c();
+        let sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap().recv();
+
+        tokio::select! {
+            _ = sigint => {
+                println!("Received SIGINT, performing cleanup...");
+            },
+            _ = sigterm => {
+                println!("Received SIGTERM, performing cleanup...");
+            },
+        }
+        route_table.free_route_table();
+    });
+    Ok(())
+}
+
 
 fn packet_route(buf: &[u8], user_conf: &UserConfig) {
     // 解析以太网帧
@@ -95,12 +118,12 @@ async fn forward_packet(self_packet: SelfPacket<'_>, user_config: &UserConfig) -
 }
 
 // 使用 HTTP 代理进行转发
-async fn forward_http(self_packet: SelfPacket, user_config: &UserConfig) -> anyhow::Result<()> {
+async fn forward_http(self_packet: SelfPacket<'_>, user_config: &UserConfig) -> anyhow::Result<()> {
     !todo!()
 }
 
 // 使用 SOCKS5 代理进行转发
-async fn forward_socks5(self_packet: SelfPacket, user_config: &UserConfig) -> anyhow::Result<()> {
+async fn forward_socks5(self_packet: SelfPacket<'_>, user_config: &UserConfig) -> anyhow::Result<()> {
     let proxy_addr = user_config.get_proxy_addr().parse::<SocketAddr>().unwrap();
     let target_addr = self_packet.get_target_addr().unwrap();
     // 连接到 SOCKS5 代理服务器
