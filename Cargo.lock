@@ -388,6 +388,7 @@ dependencies = [
  "bb8",
  "hyper",
  "pnet",
+ "thiserror",
  "tokio",
  "tokio-signal",
  "tokio-socks",

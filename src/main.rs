@@ -14,6 +14,7 @@ use tun::{Configuration, Device};
 use tokio::net::TcpStream;
 use tokio::{signal, task};
 use tokio_socks::tcp::Socks5Stream;
+
 use crate::modules::self_packet::SelfPacket;
 use crate::modules::user_config::{ProxyType, UserConfig};
 use crate::platform::macos::mac_table::MacRouteTable;
@@ -123,26 +124,35 @@ async fn forward_http(self_packet: SelfPacket<'_>, user_config: &UserConfig) -> 
 }
 
 // 使用 SOCKS5 代理进行转发
+//todo 有问题
 async fn forward_socks5(self_packet: SelfPacket<'_>, user_config: &UserConfig) -> anyhow::Result<()> {
     let proxy_addr = user_config.get_proxy_addr().parse::<SocketAddr>().unwrap();
     let target_addr = self_packet.get_target_addr().unwrap();
+
     // 连接到 SOCKS5 代理服务器
-    if (user_config.is_use_proxy_pool) {
-        // return Err("暂时不支持使用代理池子")
+    if user_config.is_use_proxy_pool {
+        println!("不支持代理ip池子");
+        return Ok(());
     }
+
     let stream = TcpStream::connect(proxy_addr).await?;
     let mut socks5_stream = Socks5Stream::connect_with_socket(stream, target_addr).await?;
-    // let manager = Socks5ConnectionManager { proxy_addr: proxy_addr, target_addr: target_addr };
-    // let pool = Pool::builder().build(manager).await?;
-    let (mut client_reader, mut client_writer) = socks5_stream.split();
     let mut response_buffer = vec![0; 1500];
+
+    // 获取底层的 TcpStream
+    let mut tcp_stream = socks5_stream.into_inner();
+    let (mut reader, mut writer) = tcp_stream.split();
+
     // 从客户端读取数据并写入到 SOCKS5 代理
     let client_to_socks5 = async {
+        let mut reader = reader; // 将 reader 移动到任务内部
+        let mut buffer = vec![0; 1500]; // 为每个任务创建独立的缓冲区
+
         loop {
-            match client_reader.read(&mut response_buffer).await {
+            match reader.read(&mut buffer).await {
                 Ok(0) => break, // 连接关闭
                 Ok(n) => {
-                    if let Err(e) = client_writer.write_all(&response_buffer[..n]).await {
+                    if let Err(e) = writer.write_all(&buffer[..n]).await {
                         eprintln!("Failed to write to SOCKS5: {}", e);
                         break;
                     }
@@ -153,14 +163,16 @@ async fn forward_socks5(self_packet: SelfPacket<'_>, user_config: &UserConfig) -
                 }
             }
         }
+        Ok::<(), io::Error>(())
     };
+
     // 从 SOCKS5 代理读取数据并写入到客户端
     let socks5_to_client = async {
         loop {
-            match client_writer.read(&mut response_buffer).await {
+            match reader.read(&mut response_buffer).await {
                 Ok(0) => break, // 连接关闭
                 Ok(n) => {
-                    if let Err(e) = client_reader.write_all(&response_buffer[..n]).await {
+                    if let Err(e) = writer.write_all(&response_buffer[..n]).await {
                         eprintln!("Failed to write to client: {}", e);
                         break;
                     }
@@ -171,8 +183,8 @@ async fn forward_socks5(self_packet: SelfPacket<'_>, user_config: &UserConfig) -
                 }
             }
         }
+        Ok::<(), io::Error>(())
     };
-
     // 并行运行两个任务
     tokio::try_join!(client_to_socks5, socks5_to_client)?;
     Ok(())
