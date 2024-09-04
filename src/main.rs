@@ -87,9 +87,11 @@ fn packet_route(buf: &[u8], user_conf: &UserConfig) {
                                 let _ = forward_packet(self_packet, user_conf);
                             }
                         }
+                        _ => error!("协议不支持")
                     }
                 }
             }
+            _ => error!("协议不支持")
         }
     }
 }
@@ -97,9 +99,9 @@ fn packet_route(buf: &[u8], user_conf: &UserConfig) {
 ///创建tun设备
 fn create_tun_dev(config: &Configuration) -> anyhow::Result<TunDevice> {
     let mut dev = TunDevice::new(&config)?;
-    let name = dev.name().to_string_lossy().into_owned();
+    let name = dev.name().unwrap();
     info!("TUN device created: {}", name);
-    dev
+    Ok(dev)
 }
 
 // 根据目标地址和端口选择使用 HTTP 或 SOCKS5 代理进行转发
