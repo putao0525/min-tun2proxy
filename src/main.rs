@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     init_log_once();
     ///解析命令行参数
     let user_conf = UserConfig::parse_params();
+    info!("用户的配置信息:{:?}",user_conf);
     let route_table = Arc::new(MacRouteTable::default());
     ///初始化路由表
     route_table.init_route_table();
